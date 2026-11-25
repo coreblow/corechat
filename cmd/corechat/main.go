@@ -78,7 +78,7 @@ func main() {
 	}
 
 	// Interactive REPL mode
-	fmt.Println("CoreBlow Chat Terminal (v2.1.2)")
+	fmt.Println("CoreBlow Chat Terminal (v2.1.5)")
 	fmt.Printf("Connected to Gateway: %s | Session: %s\n", *gatewayFlag, *sessionFlag)
 	fmt.Println("Type your message and press Enter. Press Ctrl+C or type 'exit' to quit.")
 

@@ -4,9 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -172,7 +176,12 @@ func (c *Client) CheckHealth(ctx context.Context) (*HealthStatus, error) {
 // ConnectWebSocket establishes a raw RFC 6455 WebSocket connection to the gateway
 func (c *Client) ConnectWebSocket(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			c.mu.Unlock()
+		}
+	}()
 
 	if c.wsConn != nil && !c.closed {
 		return nil
@@ -250,12 +259,135 @@ func (c *Client) ConnectWebSocket(ctx context.Context) error {
 		}
 	}
 
+	connectID := fmt.Sprintf("connect-%d", atomic.AddUint64(&c.reqCounter, 1))
+	connectCh := make(chan ResponseFrame, 1)
+	if c.pendingReq == nil {
+		c.pendingReq = make(map[string]chan ResponseFrame)
+	}
+	c.pendingReq[connectID] = connectCh
 	c.wsConn = conn
 	c.wsReader = reader
 	c.closed = false
 
 	go c.readLoop()
-	return nil
+	locked = false
+	c.mu.Unlock()
+
+	// Wait briefly for connect.challenge nonce when talking to CoreBlow Gateway v3.
+	var challengeNonce string
+	challengeWait := time.NewTimer(250 * time.Millisecond)
+	select {
+	case ev := <-c.eventCh:
+		challengeWait.Stop()
+		if ev.Event == "connect.challenge" {
+			var chPayload struct {
+				Nonce string `json:"nonce"`
+			}
+			_ = json.Unmarshal(ev.Payload, &chPayload)
+			challengeNonce = chPayload.Nonce
+		}
+	case <-challengeWait.C:
+	case <-ctx.Done():
+		challengeWait.Stop()
+		_ = c.Close()
+		return ctx.Err()
+	}
+
+	connectParams := map[string]any{
+		"minProtocol": 3,
+		"maxProtocol": 3,
+		"client": map[string]any{
+			"id":       "cli",
+			"version":  "2.1.5",
+			"platform": runtime.GOOS,
+			"mode":     "cli",
+		},
+		"role":   "operator",
+		"scopes": []string{"operator.admin"},
+	}
+	if c.opts.Token != "" {
+		connectParams["auth"] = map[string]any{
+			"token": c.opts.Token,
+		}
+	}
+	if challengeNonce != "" {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			_ = c.Close()
+			return fmt.Errorf("generating device identity: %w", err)
+		}
+		sum := sha256.Sum256(pub)
+		deviceID := hex.EncodeToString(sum[:])
+		pubB64 := base64.RawURLEncoding.EncodeToString(pub)
+		signedAt := time.Now().UnixMilli()
+		signPayload := strings.Join([]string{
+			"v3",
+			deviceID,
+			"cli",
+			"cli",
+			"operator",
+			"operator.admin",
+			fmt.Sprintf("%d", signedAt),
+			c.opts.Token,
+			challengeNonce,
+			runtime.GOOS,
+			"",
+		}, "|")
+		sigB64 := base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, []byte(signPayload)))
+		connectParams["device"] = map[string]any{
+			"id":        deviceID,
+			"publicKey": pubB64,
+			"signature": sigB64,
+			"signedAt":  signedAt,
+			"nonce":     challengeNonce,
+		}
+	}
+
+	connectFrame, err := json.Marshal(RequestFrame{
+		Type:   "req",
+		ID:     connectID,
+		Method: "connect",
+		Params: connectParams,
+	})
+	if err != nil {
+		_ = c.Close()
+		return err
+	}
+
+	if err := writeWSFrame(conn, connectFrame); err != nil {
+		_ = c.Close()
+		return fmt.Errorf("sending gateway connect handshake: %w", err)
+	}
+
+	handshakeTimeout := c.opts.Timeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 10 * time.Second
+	}
+	timer := time.NewTimer(handshakeTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		_ = c.Close()
+		return ctx.Err()
+	case <-timer.C:
+		_ = c.Close()
+		return errors.New("gateway connect handshake timed out")
+	case res, ok := <-connectCh:
+		if !ok {
+			_ = c.Close()
+			return errors.New("websocket closed during connect handshake")
+		}
+		if !res.OK {
+			errMsg := "gateway rejected connect handshake"
+			if res.Error != nil && res.Error.Message != "" {
+				errMsg = res.Error.Message
+			}
+			_ = c.Close()
+			return errors.New(errMsg)
+		}
+		return nil
+	}
 }
 
 // readLoop reads frames from the WebSocket

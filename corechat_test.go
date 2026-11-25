@@ -166,22 +166,30 @@ func TestMockWebSocketChat(t *testing.T) {
 			"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n"
 		_, _ = conn.Write([]byte(resp))
 
-		// Read request frame
-		frame, err := readWSFrame(reader)
-		if err != nil {
+		// Read request frames (connect handshake first, then chat.send)
+		for {
+			frame, err := readWSFrame(reader)
+			if err != nil {
+				return
+			}
+
+			var req RequestFrame
+			_ = json.Unmarshal(frame, &req)
+			if req.Method == "connect" {
+				ack := []byte(fmt.Sprintf(`{"type":"res","id":"%s","ok":true,"payload":{}}`, req.ID))
+				_ = writeServerWSFrame(conn, ack)
+				continue
+			}
+
+			// Send streaming event frame
+			evPayload := []byte(`{"type":"event","event":"chat.stream","payload":{"delta":"CoreBlow: live streaming chunk"}}`)
+			_ = writeServerWSFrame(conn, evPayload)
+
+			// Send final response frame
+			resPayload := []byte(fmt.Sprintf(`{"type":"res","id":"%s","ok":true,"payload":{"sessionKey":"test-ws","message":"CoreBlow: live streaming chunk","role":"assistant"}}`, req.ID))
+			_ = writeServerWSFrame(conn, resPayload)
 			return
 		}
-
-		var req RequestFrame
-		_ = json.Unmarshal(frame, &req)
-
-		// Send streaming event frame
-		evPayload := []byte(`{"type":"event","event":"chat.stream","payload":{"delta":"CoreBlow: live streaming chunk"}}`)
-		_ = writeServerWSFrame(conn, evPayload)
-
-		// Send final response frame
-		resPayload := []byte(fmt.Sprintf(`{"type":"res","id":"%s","ok":true,"payload":{"sessionKey":"test-ws","message":"CoreBlow: live streaming chunk","role":"assistant"}}`, req.ID))
-		_ = writeServerWSFrame(conn, resPayload)
 	}()
 
 	client := NewClient(ClientOptions{
