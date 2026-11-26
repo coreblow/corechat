@@ -4,14 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -236,4 +240,297 @@ func writeServerWSFrame(conn net.Conn, payload []byte) error {
 	}
 	_, err := conn.Write(payload)
 	return err
+}
+
+func TestGatewayV3Ed25519StreamingAndErrors(t *testing.T) {
+	t.Run("Ed25519ChallengeStreaming", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen failed: %v", err)
+		}
+		defer ln.Close()
+
+		const challengeNonce = "nonce-v3-12345"
+		const authToken = "gw-v3-token"
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			reader := bufio.NewReader(conn)
+			var wsKey, authHeader string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+				if strings.HasPrefix(line, "Sec-WebSocket-Key:") {
+					wsKey = strings.TrimSpace(strings.TrimPrefix(line, "Sec-WebSocket-Key:"))
+				}
+				if strings.HasPrefix(line, "Authorization:") {
+					authHeader = strings.TrimSpace(strings.TrimPrefix(line, "Authorization:"))
+				}
+			}
+			if authHeader != "Bearer "+authToken {
+				t.Errorf("unexpected Authorization header: %q", authHeader)
+				return
+			}
+
+			h := sha1.New()
+			h.Write([]byte(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+			acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+			_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n"))
+
+			// Emit Gateway v3 connect.challenge
+			challenge := fmt.Sprintf(`{"type":"event","event":"connect.challenge","payload":{"nonce":%q}}`, challengeNonce)
+			if err := writeServerWSFrame(conn, []byte(challenge)); err != nil {
+				t.Errorf("write challenge failed: %v", err)
+				return
+			}
+
+			for {
+				frame, err := readWSFrame(reader)
+				if err != nil {
+					return
+				}
+				var req RequestFrame
+				if err := json.Unmarshal(frame, &req); err != nil {
+					t.Errorf("unmarshal request failed: %v", err)
+					return
+				}
+
+				if req.Method == "connect" {
+					rawParams, _ := json.Marshal(req.Params)
+					var params struct {
+						MinProtocol int `json:"minProtocol"`
+						MaxProtocol int `json:"maxProtocol"`
+						Auth        struct {
+							Token string `json:"token"`
+						} `json:"auth"`
+						Device struct {
+							ID        string `json:"id"`
+							PublicKey string `json:"publicKey"`
+							Signature string `json:"signature"`
+							SignedAt  int64  `json:"signedAt"`
+							Nonce     string `json:"nonce"`
+						} `json:"device"`
+					}
+					if err := json.Unmarshal(rawParams, &params); err != nil {
+						t.Errorf("unmarshal connect params failed: %v", err)
+						return
+					}
+					if params.MinProtocol != 3 || params.MaxProtocol != 3 {
+						t.Errorf("unexpected protocol range: %d..%d", params.MinProtocol, params.MaxProtocol)
+						return
+					}
+					if params.Auth.Token != authToken {
+						t.Errorf("unexpected connect auth token: %q", params.Auth.Token)
+						return
+					}
+					if params.Device.Nonce != challengeNonce {
+						t.Errorf("unexpected device nonce: %q", params.Device.Nonce)
+						return
+					}
+					pubBytes, err := base64.RawURLEncoding.DecodeString(params.Device.PublicKey)
+					if err != nil || len(pubBytes) != ed25519.PublicKeySize {
+						t.Errorf("invalid ed25519 public key: %v", err)
+						return
+					}
+					sum := sha256.Sum256(pubBytes)
+					if hex.EncodeToString(sum[:]) != params.Device.ID {
+						t.Errorf("device id mismatch: got %q", params.Device.ID)
+						return
+					}
+					sigBytes, err := base64.RawURLEncoding.DecodeString(params.Device.Signature)
+					if err != nil {
+						t.Errorf("invalid signature base64: %v", err)
+						return
+					}
+					expectedSignPayload := strings.Join([]string{
+						"v3",
+						params.Device.ID,
+						"cli",
+						"cli",
+						"operator",
+						"operator.admin",
+						fmt.Sprintf("%d", params.Device.SignedAt),
+						authToken,
+						challengeNonce,
+						runtime.GOOS,
+						"",
+					}, "|")
+					if !ed25519.Verify(ed25519.PublicKey(pubBytes), []byte(expectedSignPayload), sigBytes) {
+						t.Errorf("ed25519 signature verification failed")
+						return
+					}
+					ack := fmt.Sprintf(`{"type":"res","id":%q,"ok":true,"payload":{}}`, req.ID)
+					_ = writeServerWSFrame(conn, []byte(ack))
+					continue
+				}
+
+				if req.Method == "chat.send" {
+					_ = writeServerWSFrame(conn, []byte(`{"type":"event","event":"chat.stream","payload":{"delta":"Hello "}}`))
+					time.Sleep(10 * time.Millisecond)
+					_ = writeServerWSFrame(conn, []byte(`{"type":"event","event":"chat.stream","payload":{"delta":"CoreBlow!"}}`))
+					time.Sleep(10 * time.Millisecond)
+					res := fmt.Sprintf(`{"type":"res","id":%q,"ok":true,"payload":{"sessionKey":"gw-v3","message":"Hello CoreBlow!","role":"assistant"}}`, req.ID)
+					_ = writeServerWSFrame(conn, []byte(res))
+					return
+				}
+			}
+		}()
+
+		client := NewClient(ClientOptions{
+			GatewayURL: fmt.Sprintf("ws://%s", ln.Addr().String()),
+			Token:      authToken,
+			SessionKey: "gw-v3",
+			Timeout:    2 * time.Second,
+		})
+		defer client.Close()
+
+		var chunks []string
+		res, err := client.StreamMessage(context.Background(), "hello v3", func(chunk string) {
+			chunks = append(chunks, chunk)
+		})
+		if err != nil {
+			t.Fatalf("StreamMessage failed: %v", err)
+		}
+		if res.Message != "Hello CoreBlow!" {
+			t.Fatalf("unexpected message: %q", res.Message)
+		}
+		if strings.Join(chunks, "") != "Hello CoreBlow!" {
+			t.Fatalf("unexpected streamed chunks: %#v", chunks)
+		}
+		wg.Wait()
+	})
+
+	t.Run("RejectedHandshakeError", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen failed: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			reader := bufio.NewReader(conn)
+			var wsKey string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+				if strings.HasPrefix(line, "Sec-WebSocket-Key:") {
+					wsKey = strings.TrimSpace(strings.TrimPrefix(line, "Sec-WebSocket-Key:"))
+				}
+			}
+			h := sha1.New()
+			h.Write([]byte(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+			acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+			_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n"))
+
+			_ = writeServerWSFrame(conn, []byte(`{"type":"event","event":"connect.challenge","payload":{"nonce":"bad-nonce"}}`))
+			frame, err := readWSFrame(reader)
+			if err != nil {
+				return
+			}
+			var req RequestFrame
+			_ = json.Unmarshal(frame, &req)
+			rej := fmt.Sprintf(`{"type":"res","id":%q,"ok":false,"error":{"code":"unauthorized","message":"invalid device signature"}}`, req.ID)
+			_ = writeServerWSFrame(conn, []byte(rej))
+		}()
+
+		client := NewClient(ClientOptions{
+			GatewayURL: fmt.Sprintf("ws://%s", ln.Addr().String()),
+			Timeout:    2 * time.Second,
+		})
+		defer client.Close()
+
+		err = client.ConnectWebSocket(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "invalid device signature") {
+			t.Fatalf("expected invalid device signature error, got: %v", err)
+		}
+	})
+
+	t.Run("DisconnectDuringStreamError", func(t *testing.T) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen failed: %v", err)
+		}
+		defer ln.Close()
+
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			reader := bufio.NewReader(conn)
+			var wsKey string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+				if strings.HasPrefix(line, "Sec-WebSocket-Key:") {
+					wsKey = strings.TrimSpace(strings.TrimPrefix(line, "Sec-WebSocket-Key:"))
+				}
+			}
+			h := sha1.New()
+			h.Write([]byte(wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+			acceptKey := base64.StdEncoding.EncodeToString(h.Sum(nil))
+			_, _ = conn.Write([]byte("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n"))
+
+			for {
+				frame, err := readWSFrame(reader)
+				if err != nil {
+					return
+				}
+				var req RequestFrame
+				_ = json.Unmarshal(frame, &req)
+				if req.Method == "connect" {
+					ack := fmt.Sprintf(`{"type":"res","id":%q,"ok":true,"payload":{}}`, req.ID)
+					_ = writeServerWSFrame(conn, []byte(ack))
+					continue
+				}
+				// Close abruptly on chat.send
+				return
+			}
+		}()
+
+		client := NewClient(ClientOptions{
+			GatewayURL: fmt.Sprintf("ws://%s", ln.Addr().String()),
+			Timeout:    2 * time.Second,
+		})
+		defer client.Close()
+
+		if err := client.ConnectWebSocket(context.Background()); err != nil {
+			t.Fatalf("ConnectWebSocket failed: %v", err)
+		}
+		_, err = client.StreamMessage(context.Background(), "ping", nil)
+		if err == nil {
+			t.Fatal("expected error on disconnect during stream, got nil")
+		}
+	})
 }

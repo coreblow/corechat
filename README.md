@@ -54,6 +54,29 @@ go run ./cmd/corechat --gateway http://127.0.0.1:18789 --health
 | `--session` | `COREBLOW_SESSION` | `default` | Session key for conversation persistence |
 | `--prompt` | — | `""` | Headless prompt to execute and stream to stdout |
 | `--health` | — | `false` | Inspect gateway health snapshot and exit |
+| `--version` | — | `false` | Print CoreChat version and exit |
+
+## Release Binaries
+
+Tagged releases (`v*`) publish 6 static binaries (`CGO_ENABLED=0`) with `SHA256SUMS.txt`, a CycloneDX SBOM (`sbom.cdx.json`), and GitHub Actions build provenance attestations:
+
+- `corechat-darwin-arm64` (macOS Apple Silicon)
+- `corechat-darwin-amd64` (macOS Intel)
+- `corechat-linux-amd64` (Linux x86_64)
+- `corechat-linux-arm64` (Linux ARM64)
+- `corechat-windows-amd64.exe` (Windows x86_64)
+- `corechat-windows-arm64.exe` (Windows ARM64)
+
+Verify downloaded binaries with:
+
+```sh
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
+
+## Subpackages
+
+- `pkg/corekit`: Endpoint normalization (`NormalizeEndpoint`) and local-host detection (`IsLocal`) helpers.
+- `pkg/coredex`: Contact normalization (`NormalizeContact`) and searchable display/address lookup helpers (`SearchableName`).
 
 ## Development & Testing
 

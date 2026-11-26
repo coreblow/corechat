@@ -14,6 +14,8 @@ import (
 	"github.com/coreblow/corechat"
 )
 
+var version = "dev"
+
 func getEnv(key, fallback string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -27,7 +29,13 @@ func main() {
 	sessionFlag := flag.String("session", getEnv("COREBLOW_SESSION", "default"), "Session Key")
 	promptFlag := flag.String("prompt", "", "Headless prompt to send immediately")
 	healthFlag := flag.Bool("health", false, "Check Gateway health and exit")
+	versionFlag := flag.Bool("version", false, "Print CoreChat version and exit")
 	flag.Parse()
+
+	if *versionFlag {
+		fmt.Println(version)
+		return
+	}
 
 	client := corechat.NewClient(corechat.ClientOptions{
 		GatewayURL: *gatewayFlag,
@@ -78,7 +86,7 @@ func main() {
 	}
 
 	// Interactive REPL mode
-	fmt.Println("CoreBlow Chat Terminal (v2.1.5)")
+	fmt.Printf("CoreBlow Chat Terminal (%s)\n", version)
 	fmt.Printf("Connected to Gateway: %s | Session: %s\n", *gatewayFlag, *sessionFlag)
 	fmt.Println("Type your message and press Enter. Press Ctrl+C or type 'exit' to quit.")
 
